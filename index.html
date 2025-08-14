@@ -155,9 +155,12 @@
     fanOut.gain.value = 1;
     micSource.connect(fanOut); // do NOT connect to destination (no echo)
 
+    // Ensure audio context is running (some browsers start suspended)
+    try { if (audioCtx.state === 'suspended') { await audioCtx.resume(); } } catch(e) { console.warn('resume failed', e); }
+
     // Hook into current visualizer(s)
     connectSpectrum();
-    connectMilkdrop();
+    try { connectMilkdrop(); } catch(e) { console.warn('MilkDrop connect error', e); }
 
     statusEl.textContent = 'Mic: on';
     startBtn.disabled = true;
@@ -374,6 +377,13 @@
     milkCanvas.height = Math.max(1, Math.floor(h));
     milkdrop.setRendererSize(w, h);
   }
+  function connectMilkdrop(){
+    if(!fanOut) return; // mic not started yet
+    const BC = getButter();
+    if(!BC) return; // butter not loaded yet
+    if(!milkdrop) ensureMilkdrop();
+    try { if (milkdrop && typeof milkdrop.connectAudio === 'function') milkdrop.connectAudio(fanOut); } catch(e) { console.warn('connectAudio failed', e); }
+  }
 
   function renderMilkdrop(){
     if(!milkdrop) return;
@@ -402,6 +412,7 @@
     // wait a frame for layout so client sizes are correct
     await new Promise(r=>requestAnimationFrame(r));
     ensureMilkdrop();
+    connectMilkdrop();
     resizeMilkdrop();
     if(!presetSelect.value) pickRandomPreset();
     if(!milkAnimRAF) renderMilkdrop();

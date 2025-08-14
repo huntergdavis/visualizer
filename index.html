@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Old‑School Visualizer (Mic + Winamp/MilkDrop)</title>
+  <style>
+    :root{
+      --bg:#0c0f12; --fg:#e6edf3; --muted:#93a1ad; --accent:#5ee1ff; --accent2:#ff9df5;
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font:14px/1.3 system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji"}
+    .app{display:flex;flex-direction:column;height:100%}
+    header{display:flex;gap:.75rem;align-items:center;flex-wrap:wrap;padding:.7rem 1rem;border-bottom:1px solid #1d2733;background:linear-gradient(180deg,#0e1319,#0a0d11)}
+    header h1{font-size:15px;margin:0 1rem 0 0;white-space:nowrap;letter-spacing:.2px;color:#d6e2ee}
+    select,button,input[type="checkbox"]{background:#0f1620;border:1px solid #223142;color:var(--fg);padding:.45rem .6rem;border-radius:8px}
+    select:focus,button:focus{outline:2px solid #2e8fce}
+    button.primary{background:linear-gradient(180deg,#1283c5,#0b6aac);border-color:#0a5f9a}
+    button.danger{background:linear-gradient(180deg,#7b1e1e,#611515);border-color:#4b1111}
+    button:disabled{opacity:.5;cursor:not-allowed}
+    #status{margin-left:auto;font-size:12px;color:var(--muted)}
+    #warning{color:#ffd36e;margin-left:.6rem}
+    main{position:relative;flex:1;min-height:0}
+    .viz{position:absolute;inset:0;display:none;width:100%;height:100%}
+    .viz.active{display:block}
+    #spectrumContainer{padding:0}
+    footer{padding:.5rem 1rem;border-top:1px solid #1d2733;color:#9fb0bf;font-size:12px;background:#0a0e13;display:flex;gap:1rem;align-items:center;flex-wrap:wrap}
+    .row{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
+    .hidden{display:none !important}
+    .spacer{flex:1}
+    .pill{background:#101827;border:1px solid #1f2c3c;border-radius:999px;padding:.2rem .6rem;color:#a3b6c8}
+    #milkdropCanvas{width:100%;height:100%;display:block}
+  #spectrumContainer{width:100%;height:100%}
+  #spectrumContainer canvas{width:100% !important;height:100% !important}
+  main{overflow:hidden}
+  </style>
+  <!-- AudioMotion (spectrum analyzer) - UMD build provides global AudioMotionAnalyzer -->
+  <script src="https://unpkg.com/audiomotion-analyzer@4/dist"></script>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <h1>🎛️ Old‑School Visualizer</h1>
+      <button id="startBtn" class="primary">Start Microphone</button>
+      <button id="stopBtn" class="danger" disabled>Stop</button>
+
+      <label class="row" title="Choose a visualization">
+        <span class="pill">Visualization</span>
+        <select id="vizSelect">
+          <option value="milkdrop">MilkDrop (Winamp presets)</option>
+          <option value="bars" selected>Spectrum – Bars</option>
+          <option value="led">Spectrum – LED Bars</option>
+          <option value="radial">Spectrum – Radial</option>
+        </select>
+      </label>
+
+      <!-- MilkDrop preset controls (shown only in MilkDrop mode) -->
+      <label id="presetWrap" class="row hidden" title="Choose a MilkDrop preset">
+        <span class="pill">Preset</span>
+        <select id="presetSelect"></select>
+        <button id="randomPresetBtn" title="Pick a random preset">Random</button>
+        <label class="row" style="gap:.3rem"><input id="autoCycle" type="checkbox"/> auto‑cycle</label>
+      </label>
+
+      <button id="fsBtn" title="Fullscreen the current visualizer">Fullscreen</button>
+      <span id="status">Mic: off</span>
+      <span id="warning" class="hidden">⚠️ Safari mic visualizations may not work (Web Audio live stream bug).</span>
+    </header>
+
+    <main>
+      <!-- MilkDrop canvas -->
+      <canvas id="milkdropCanvas" class="viz"></canvas>
+      <!-- AudioMotion container (creates its own canvas) -->
+      <div id="spectrumContainer" class="viz active"></div>
+    </main>
+
+    <footer>
+      <span>Libraries: MilkDrop via Butterchurn, Spectrum via audioMotion‑analyzer. Mic only; no backend.</span>
+      <span class="spacer"></span>
+      <span><a href="#" id="aboutLink" style="color:var(--accent)">About & tips</a></span>
+    </footer>
+  </div>
+
+  <script>
+  // --- Basic feature checks & Safari hint ---
+  const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+  const warningEl = document.getElementById('warning');
+  if (isSafari) warningEl.classList.remove('hidden');
+
+  // --- DOM elements ---
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const vizSelect = document.getElementById('vizSelect');
+  const milkCanvas = document.getElementById('milkdropCanvas');
+  const specContainer = document.getElementById('spectrumContainer');
+  const statusEl = document.getElementById('status');
+  const fsBtn = document.getElementById('fsBtn');
+  const presetWrap = document.getElementById('presetWrap');
+  const presetSelect = document.getElementById('presetSelect');
+  const randomPresetBtn = document.getElementById('randomPresetBtn');
+  const autoCycle = document.getElementById('autoCycle');
+  const aboutLink = document.getElementById('aboutLink');
+  const mainEl = document.querySelector('main');
+
+  // --- Audio graph ---
+  let audioCtx, micStream, micSource, fanOut;
+
+  // Visualizers
+  let audioMotion = null;               // spectrum (AudioMotion)
+  let milkdrop = null;                  // butterchurn visualizer
+  let butterLoaded = false;             // butterchurn + presets loaded?
+  let milkAnimRAF = 0;                  // animation frame for MilkDrop
+  let presets = null;                   // object: name -> preset
+  let presetNames = [];
+  let cycleTimer = 0;
+
+  // Utility: show a given element as the active visualizer
+  function activateViz(which){
+    for(const el of document.querySelectorAll('.viz')) el.classList.remove('active');
+    if(which==='milkdrop') milkCanvas.classList.add('active');
+    else specContainer.classList.add('active');
+
+    // toggle preset UI
+    presetWrap.classList.toggle('hidden', which!=='milkdrop');
+  }
+
+  function ensureAudioCtx(){
+    if(!audioCtx){
+      const AC = window.AudioContext || window.webkitAudioContext;
+      audioCtx = new AC();
+    }
+    return audioCtx;
+  }
+
+  async function startMic(){
+    ensureAudioCtx();
+    await ensureAudioMotionScript().catch(()=>{});
+    try{
+      // Helpful mic constraints for more reactive visuals
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false
+        }
+      });
+    }catch(err){
+      alert('Microphone error: ' + (err && err.message ? err.message : err));
+      return;
+    }
+
+    // Build graph once
+    micSource = audioCtx.createMediaStreamSource(micStream);
+    fanOut = audioCtx.createGain();
+    fanOut.gain.value = 1;
+    micSource.connect(fanOut); // do NOT connect to destination (no echo)
+
+    // Hook into current visualizer(s)
+    connectSpectrum();
+    connectMilkdrop();
+
+    statusEl.textContent = 'Mic: on';
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+  }
+
+  function stopMic(){
+    if(cycleTimer){ clearInterval(cycleTimer); cycleTimer = 0; }
+    if(milkAnimRAF){ cancelAnimationFrame(milkAnimRAF); milkAnimRAF = 0; }
+
+    if(micStream){
+      micStream.getTracks().forEach(t=>t.stop());
+      micStream = null;
+    }
+    if(audioCtx){
+      // Suspends instead of closing (Safari likes this better)
+      audioCtx.suspend();
+    }
+    statusEl.textContent = 'Mic: off';
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+  }
+
+  // --- Ensure AudioMotion script (with CDN fallback) ---
+  async function ensureAudioMotionScript(){
+    if (window.AudioMotionAnalyzer) return true;
+    const tryLoad = (src) => new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = src; s.async = true;
+      s.onload = () => resolve(true);
+      s.onerror = () => reject(new Error('load failed ' + src));
+      document.head.appendChild(s);
+    });
+    try { await tryLoad('https://cdn.jsdelivr.net/npm/audiomotion-analyzer@4/dist/index.min.js'); } catch(_) {}
+    if (window.AudioMotionAnalyzer) return true;
+    try { await tryLoad('https://cdn.jsdelivr.net/npm/audiomotion-analyzer@4/dist/index.js'); } catch(_) {}
+    return !!window.AudioMotionAnalyzer;
+  }
+
+  // --- Spectrum (AudioMotion) ---
+  function ensureAudioMotion(){
+    if(!window.AudioMotionAnalyzer){
+      return null;
+    }
+    if(!audioMotion){
+      audioMotion = new AudioMotionAnalyzer(specContainer, {
+        audioCtx,
+        connectSpeakers: false, // avoid feedback
+        gradient: 'prism',
+        showPeaks: true,
+        mirror: 1,
+        mode: 0 // discrete frequencies (classic bars)
+      });
+    }
+    return audioMotion;
+  }
+
+  function connectSpectrum(){
+    if(!micSource) return;
+    const am = ensureAudioMotion();
+    if(!am) return;
+    try{ am.connectInput(fanOut); }catch(e){ /* already connected */ }
+  }
+
+  // Mutate spectrum look based on selection
+  function configureSpectrum(style){
+    const am = ensureAudioMotion();
+    if(!am) return;
+    // ensure size when toggling from display:none -> block
+    am.setOptions({ width: specContainer.clientWidth || undefined, height: specContainer.clientHeight || undefined });
+
+    if(style==='bars'){
+      am.setOptions({ radial:false, ledBars:false, outlineBars:false, gradient:'prism', showPeaks:true, mode:0 });
+    } else if(style==='led'){
+      am.setOptions({ radial:false, ledBars:true, outlineBars:false, gradient:'classic', showPeaks:false, mode:0 });
+    } else if(style==='radial'){
+      am.setOptions({ radial:true, ledBars:false, outlineBars:false, gradient:'rainbow', showPeaks:false, mode:0 });
+    }
+
+    if (fanOut){
+      try { am.connectInput(fanOut); } catch(e){}
+    }
+  }
+
+  // --- MilkDrop (Butterchurn) ---
+  function loadScript(src){
+    return new Promise((resolve, reject)=>{
+      const s = document.createElement('script');
+      s.src = src; s.async = true; s.onload = resolve; s.onerror = reject; document.head.appendChild(s);
+    });
+  }
+
+  function getButter(){
+    const bc = window.butterchurn;
+    if (!bc) return null;
+    if (typeof bc.createVisualizer === 'function') return bc;
+    if (bc.default && typeof bc.default.createVisualizer === 'function') return bc.default;
+    if (bc.butterchurn && typeof bc.butterchurn.createVisualizer === 'function') return bc.butterchurn;
+    return null;
+  }
+
+  async function ensureButterchurn(){
+    if(butterLoaded) return true;
+
+    // Check WebGL2 support first
+    if(!('WebGL2RenderingContext' in window)){
+      alert('MilkDrop requires WebGL2; your browser/device does not support it. Try the Spectrum modes.');
+      return false;
+    }
+
+    // Try multiple CDNs/paths for compatibility
+    const tryLoadList = async (urls)=>{
+      for(const url of urls){
+        try { await loadScript(url); } catch(_) {}
+        if (getButter()) return true;
+      }
+      return false;
+    };
+
+    try{
+      // isSupported helper (optional)
+      await loadScript('https://cdn.jsdelivr.net/npm/butterchurn@2.6.7/lib/isSupported.min.js');
+      if(window.isButterchurnSupported && !window.isButterchurnSupported()){
+        alert('Butterchurn not supported in this browser. Try Spectrum modes.');
+        return false;
+      }
+
+      // Primary + fallbacks for core lib
+      const okScript = await tryLoadList([
+        'https://cdn.jsdelivr.net/npm/butterchurn@2.6.7/lib/butterchurn.min.js',
+        'https://unpkg.com/butterchurn@2.6.7/lib/butterchurn.min.js',
+        // some builds publish also at the package root
+        'https://cdn.jsdelivr.net/npm/butterchurn@2.6.7/butterchurn.min.js',
+        'https://unpkg.com/butterchurn@2.6.7/butterchurn.min.js'
+      ]);
+
+      // Presets (UMD)
+      if (!window.butterchurnPresets){
+        await tryLoadList([
+          'https://cdn.jsdelivr.net/npm/butterchurn-presets@2.4.7/lib/butterchurnPresets.min.js',
+          'https://unpkg.com/butterchurn-presets@2.4.7/lib/butterchurnPresets.min.js'
+        ]);
+      }
+
+      // As a last resort, load ESM dynamically and attach to window
+      if (!getButter()){
+        try {
+          const mod = await import('https://esm.run/butterchurn@2.6.7');
+          window.butterchurn = mod.default || mod;
+        } catch(_){}
+      }
+      if (!window.butterchurnPresets){
+        try {
+          const modP = await import('https://esm.run/butterchurn-presets@2.4.7');
+          window.butterchurnPresets = modP.default || modP;
+        } catch(_){}
+      }
+
+      if (!getButter()) throw new Error('Butterchurn global not found after loads');
+      if (!window.butterchurnPresets || !window.butterchurnPresets.getPresets) throw new Error('Presets not available');
+    }catch(e){
+      console.error(e);
+      alert('Failed to load MilkDrop (Butterchurn) scripts.');
+      return false;
+    }
+
+    presets = window.butterchurnPresets.getPresets();
+    presetNames = Object.keys(presets).sort();
+
+    // build preset dropdown
+    presetSelect.innerHTML = '';
+    for(const name of presetNames){
+      const opt = document.createElement('option');
+      opt.value = name; opt.textContent = name; presetSelect.appendChild(opt);
+    }
+
+    butterLoaded = true;
+    return true;
+  }
+
+  function getVizSize(){
+    const el = milkCanvas.parentElement || mainEl || milkCanvas;
+    const r = el.getBoundingClientRect();
+    const w = Math.max(1, Math.floor(r.width));
+    const h = Math.max(1, Math.floor(r.height));
+    return { w, h };
+  }
+
+  function ensureMilkdrop(){
+    if(milkdrop) return milkdrop;
+    if(!audioCtx) return null;
+
+    const BC = getButter();
+    if(!BC){ alert('Butterchurn loaded, but no createVisualizer export found.'); return null; }
+
+    const { w, h } = getVizSize();
+    // Ensure canvas fills container (CSS size)
+    milkCanvas.style.width = '100%';
+    milkCanvas.style.height = '100%';
+    // Match drawing buffer to CSS size (avoids quadrant issues across DPR/zoom)
+    milkCanvas.width = Math.max(1, Math.floor(w));
+    milkCanvas.height = Math.max(1, Math.floor(h));
+
+    milkdrop = BC.createVisualizer(audioCtx, milkCanvas, { width: w, height: h });
+    return milkdrop;
+  }
+
+  function resizeMilkdrop(){
+    if(!milkdrop) return;
+    const { w, h } = getVizSize();
+    milkCanvas.style.width = '100%';
+    milkCanvas.style.height = '100%';
+    milkCanvas.width = Math.max(1, Math.floor(w));
+    milkCanvas.height = Math.max(1, Math.floor(h));
+    milkdrop.setRendererSize(w, h);
+  }
+
+  function renderMilkdrop(){
+    if(!milkdrop) return;
+    milkAnimRAF = requestAnimationFrame(renderMilkdrop);
+    milkdrop.render();
+  }
+
+  function loadPresetByName(name, blend=2.0){
+    if(!milkdrop || !presets) return;
+    const p = presets[name];
+    if(p) milkdrop.loadPreset(p, blend);
+  }
+
+  function pickRandomPreset(){
+    if(!presetNames.length) return null;
+    const name = presetNames[Math.floor(Math.random()*presetNames.length)];
+    presetSelect.value = name;
+    loadPresetByName(name, 1.5);
+    return name;
+  }
+
+  async function activateMilkdrop(){
+    const ok = await ensureButterchurn();
+    if(!ok) return;
+    activateViz('milkdrop');
+    // wait a frame for layout so client sizes are correct
+    await new Promise(r=>requestAnimationFrame(r));
+    ensureMilkdrop();
+    resizeMilkdrop();
+    if(!presetSelect.value) pickRandomPreset();
+    if(!milkAnimRAF) renderMilkdrop();
+  }
+
+  // --- UI wiring ---
+  startBtn.addEventListener('click', async ()=>{
+    await startMic();
+    // configure current viz on first start
+    const v = vizSelect.value;
+    if(v==='milkdrop') activateMilkdrop(); else { activateViz('spectrum'); configureSpectrum(v); }
+  });
+
+  stopBtn.addEventListener('click', stopMic);
+
+  vizSelect.addEventListener('change', async (e)=>{
+    const v = e.target.value;
+    if(v==='milkdrop'){
+      await activateMilkdrop();
+    }else{
+      await ensureAudioMotionScript().catch(()=>{});
+      activateViz('spectrum');
+      // allow DOM to apply layout before sizing
+      requestAnimationFrame(()=>{
+        configureSpectrum(v);
+      });
+      connectSpectrum();
+    }
+  });
+
+  presetSelect.addEventListener('change', ()=> loadPresetByName(presetSelect.value, 1.2));
+  randomPresetBtn.addEventListener('click', pickRandomPreset);
+  autoCycle.addEventListener('change', ()=>{
+    if(cycleTimer){ clearInterval(cycleTimer); cycleTimer = 0; }
+    if(autoCycle.checked){ cycleTimer = setInterval(pickRandomPreset, 30000); }
+  });
+
+  fsBtn.addEventListener('click', ()=>{
+    if(milkCanvas.classList.contains('active')){
+      try { milkCanvas.requestFullscreen?.(); } catch(_){}
+      // nudge a resize immediately; fullscreenchange will also handle it
+      setTimeout(resizeMilkdrop, 0);
+    } else if(audioMotion){
+      audioMotion.toggleFullscreen();
+    }
+  });
+
+  let lastPR = window.devicePixelRatio || 1;
+  window.addEventListener('resize', ()=>{
+    const pr = window.devicePixelRatio || 1;
+    if (pr !== lastPR){ lastPR = pr; }
+    resizeMilkdrop();
+    if (audioMotion){
+      audioMotion.setOptions({ width: specContainer.clientWidth || undefined, height: specContainer.clientHeight || undefined });
+    }
+  });
+  document.addEventListener('fullscreenchange', ()=>{
+    // resize on the next frame and a short delay to catch orientation swaps
+    requestAnimationFrame(resizeMilkdrop);
+    setTimeout(resizeMilkdrop, 100);
+  });
+  if ('ResizeObserver' in window){
+    const ro = new ResizeObserver(()=>resizeMilkdrop());
+    ro.observe(mainEl || document.querySelector('main'));
+  }
+
+  aboutLink.addEventListener('click', (e)=>{
+    e.preventDefault();
+    alert(
+`How it works\n\n• MilkDrop (Winamp-style) visualizations are provided by Butterchurn with its preset packs.\n• Spectrum modes are provided by audioMotion‑analyzer.\n• Everything runs entirely in your browser (no servers).\n\nTips\n• Click Start Microphone, then choose a visualization.\n• In MilkDrop, enable auto‑cycle to rotate presets every 30s.\n• Use the Fullscreen button for party mode.\n\nTroubleshooting\n• Safari: microphone-based analyzer data may not be available due to a Web Audio bug. Use Chrome/Edge/Firefox.\n• If MilkDrop says unsupported, your device may lack WebGL2.`
+    );
+  });
+
+  // Default view = Spectrum UI; wait for user gesture to start mic.
+  activateViz('spectrum');
+  // Proactively ensure analyzer script; will fall back to jsDelivr if unpkg failed.
+  (async()=>{ try { await ensureAudioMotionScript(); } catch(_){} })();
+  </script>
+</body>
+</html>
+
